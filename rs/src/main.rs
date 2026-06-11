@@ -34,6 +34,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 
 const ID_REMOTE: usize = 1;
 const ID_ONSITE: usize = 2;
+const ID_VEIL: usize = 3;
 const ID_ABOUT: usize = 12;
 const ID_UPDATE: usize = 13;
 const ID_EXIT: usize = 11;
@@ -74,7 +75,11 @@ const ONSITE_TIMEOUTS: [(&str, u32); 6] = [
 
 // ---------- Globals (single-threaded; touched only from the message thread) ----------
 static mut MODE: Mode = Mode::Remote;
-static mut TRAY_ICON: isize = 0; // current tray HICON (RM/OS badge, rebuilt on mode change)
+static mut TRAY_ICON: isize = 0; // current tray HICON (brand logo, rebuilt on mode change)
+
+static mut VEIL_ON: bool = false; // persisted toggle: red "EM CONTROLE REMOTO" screen veil
+static mut VEIL_WINDOWS: Vec<isize> = Vec::new(); // one HWND per monitor while the veil is up
+static mut VEIL_CLASS_REGISTERED: bool = false;
 
 static mut ABOUT_HWND: Option<HWND> = None;
 static mut ABOUT_ICON: isize = 0; // brand logo (embedded energyflag.ico, or GDI fallback)
@@ -107,11 +112,11 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
-// ---------- Persisted choice ----------
-fn read_mode() -> Mode {
+// ---------- Persisted choices (HKCU\Software\EnergyFlag string values) ----------
+fn reg_read(value: &str) -> Option<String> {
     unsafe {
         let sk = w(REG_SUBKEY);
-        let v = w("Mode");
+        let v = w(value);
         let mut buf = [0u16; 16];
         let mut size = (buf.len() * 2) as u32;
         let rc = RegGetValueW(
@@ -124,18 +129,14 @@ fn read_mode() -> Mode {
             Some(&mut size),
         );
         if rc != ERROR_SUCCESS {
-            return Mode::Remote;
+            return None;
         }
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        if String::from_utf16_lossy(&buf[..len]) == "ONSITE" {
-            Mode::OnSite
-        } else {
-            Mode::Remote
-        }
+        Some(String::from_utf16_lossy(&buf[..len]))
     }
 }
 
-fn write_mode(mode: Mode) {
+fn reg_write(value: &str, data: &str) {
     unsafe {
         let sk = w(REG_SUBKEY);
         let mut hkey = HKEY::default();
@@ -153,15 +154,30 @@ fn write_mode(mode: Mode) {
         if rc != ERROR_SUCCESS {
             return;
         }
-        let val = match mode {
-            Mode::Remote => "REMOTE",
-            Mode::OnSite => "ONSITE",
-        };
-        let data = w(val);
+        let data = w(data);
         let bytes = core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2);
-        let _ = RegSetValueExW(hkey, PCWSTR(w("Mode").as_ptr()), 0, REG_SZ, Some(bytes));
+        let _ = RegSetValueExW(hkey, PCWSTR(w(value).as_ptr()), 0, REG_SZ, Some(bytes));
         let _ = RegCloseKey(hkey);
     }
+}
+
+fn read_mode() -> Mode {
+    match reg_read("Mode").as_deref() {
+        Some("ONSITE") => Mode::OnSite,
+        _ => Mode::Remote,
+    }
+}
+
+fn write_mode(mode: Mode) {
+    reg_write("Mode", if mode == Mode::Remote { "REMOTE" } else { "ONSITE" });
+}
+
+fn read_veil() -> bool {
+    reg_read("Veil").as_deref() == Some("1")
+}
+
+fn write_veil(on: bool) {
+    reg_write("Veil", if on { "1" } else { "0" });
 }
 
 // ---------- Power plan enforcement ----------
@@ -194,6 +210,7 @@ unsafe fn apply_mode(hwnd: HWND, mode: Mode) {
     write_mode(mode);
     apply_profile(mode);
     refresh_tray(hwnd);
+    sync_veil(hwnd); // the veil only exists in Remote Mode
 }
 
 // ---------- GDI-drawn icons (tray badge "RM"/"OS"; brand fallback "E") ----------
@@ -258,22 +275,63 @@ unsafe fn make_text_icon(bg: COLORREF, label: &str) -> HICON {
     hicon
 }
 
-unsafe fn mode_icon(mode: Mode) -> HICON {
-    match mode {
-        // Both modes use DeskFlag blue (#2563EB) — only the label differs.
-        Mode::Remote => make_text_icon(rgb(37, 99, 235), "RM"),
-        Mode::OnSite => make_text_icon(rgb(37, 99, 235), "OS"),
+// The tray shows the brand logo (lightning bolt) in both modes — the active mode lives in
+// the tooltip and the menu radio. CopyIcon because refresh_tray destroys the old handle.
+unsafe fn tray_icon() -> HICON {
+    if ABOUT_ICON != 0 {
+        if let Ok(h) = CopyIcon(HICON(ABOUT_ICON as *mut _)) {
+            return h;
+        }
     }
+    make_text_icon(rgb(37, 99, 235), "E")
 }
 
-// Brand icon (taskbar / About / installer): the embedded energyflag.ico (MSVC build) if
-// present, else an energyflag.ico next to the exe, else a GDI-drawn DeskFlag-blue "E".
+// The brand .ico compiled into the binary, so the lightning-bolt logo shows up on every
+// toolchain (the GNU build has no embedded RT_ICON resource — see build.rs).
+const ICO_BYTES: &[u8] = include_bytes!("../assets/energyflag.ico");
+
+// Parse the .ico directory (6-byte header + 16-byte entries), pick the largest image and
+// hand its data to Windows. Entries store width 0 to mean 256 px.
+unsafe fn icon_from_embedded_bytes() -> Option<HICON> {
+    if ICO_BYTES.len() < 6 {
+        return None;
+    }
+    let count = u16::from_le_bytes([ICO_BYTES[4], ICO_BYTES[5]]) as usize;
+    let mut best: Option<(u32, usize, usize)> = None; // (width px, offset, byte size)
+    for i in 0..count {
+        let e = 6 + i * 16;
+        if e + 16 > ICO_BYTES.len() {
+            break;
+        }
+        let wpx = match ICO_BYTES[e] {
+            0 => 256u32,
+            n => n as u32,
+        };
+        let size = u32::from_le_bytes(ICO_BYTES[e + 8..e + 12].try_into().ok()?) as usize;
+        let off = u32::from_le_bytes(ICO_BYTES[e + 12..e + 16].try_into().ok()?) as usize;
+        if off + size > ICO_BYTES.len() {
+            continue;
+        }
+        if best.map_or(true, |(bw, _, _)| wpx > bw) {
+            best = Some((wpx, off, size));
+        }
+    }
+    let (_, off, size) = best?;
+    CreateIconFromResourceEx(&ICO_BYTES[off..off + size], TRUE, 0x0003_0000, 0, 0, LR_DEFAULTSIZE).ok()
+}
+
+// Brand icon (tray / About / dialogs): the embedded energyflag.ico resource (MSVC build),
+// else the .ico bytes compiled into the binary, else an energyflag.ico next to the exe,
+// else a GDI-drawn DeskFlag-blue "E".
 unsafe fn load_app_icon() -> HICON {
     let hinst: HINSTANCE = GetModuleHandleW(None).map(|h| h.into()).unwrap_or_default();
     if let Ok(h) = LoadIconW(hinst, PCWSTR(1 as *const u16)) {
         if !h.is_invalid() {
             return h;
         }
+    }
+    if let Some(h) = icon_from_embedded_bytes() {
+        return h;
     }
     if let Some(h) = icon_from_file() {
         return h;
@@ -314,7 +372,7 @@ unsafe fn tooltip() -> &'static str {
 }
 
 unsafe fn add_tray(hwnd: HWND) {
-    let icon = mode_icon(MODE);
+    let icon = tray_icon();
     TRAY_ICON = icon.0 as isize;
     let mut nid = tray_base(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
@@ -327,7 +385,7 @@ unsafe fn add_tray(hwnd: HWND) {
 }
 
 unsafe fn refresh_tray(hwnd: HWND) {
-    let icon = mode_icon(MODE);
+    let icon = tray_icon();
     let mut nid = tray_base(hwnd);
     nid.uFlags = NIF_ICON | NIF_TIP;
     nid.hIcon = icon;
@@ -353,6 +411,12 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let active = if MODE == Mode::Remote { ID_REMOTE } else { ID_ONSITE } as u32;
     let _ = CheckMenuRadioItem(menu, ID_REMOTE as u32, ID_ONSITE as u32, active, MF_BYCOMMAND.0);
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    // The veil only makes sense while the machine is being driven remotely → Remote Mode only.
+    let veil_flags = MF_STRING
+        | if VEIL_ON { MF_CHECKED } else { MF_UNCHECKED }
+        | if MODE == Mode::Remote { MENU_ITEM_FLAGS(0) } else { MF_GRAYED };
+    let _ = AppendMenuW(menu, veil_flags, ID_VEIL, PCWSTR(w("Aviso na tela — EM CONTROLE REMOTO").as_ptr()));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, PCWSTR(w("About EnergyFlag").as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, PCWSTR(w("Check for updates…").as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -366,6 +430,11 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     match cmd.0 as usize {
         ID_REMOTE => apply_mode(hwnd, Mode::Remote),
         ID_ONSITE => apply_mode(hwnd, Mode::OnSite),
+        ID_VEIL => {
+            VEIL_ON = !VEIL_ON;
+            write_veil(VEIL_ON);
+            sync_veil(hwnd);
+        }
         ID_ABOUT => {
             set_active_work();
             show_about();
@@ -391,6 +460,116 @@ unsafe fn set_active_work() {
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
     );
     ACTIVE_WORK = work;
+}
+
+// ===================== Remote-control screen veil =====================
+// A nearly-opaque pastel-red layered window over every monitor with a bold
+// "EM CONTROLE REMOTO" in the middle, so anyone in front of the machine sees at a glance
+// that it's being driven remotely. Purely visual by construction:
+//   WS_EX_TRANSPARENT  — hit-testing falls straight through, clicks land on whatever is under
+//   WS_EX_NOACTIVATE   — never steals focus, never becomes the foreground window
+//   WS_EX_TOOLWINDOW   — no taskbar button, no Alt+Tab entry
+// And WDA_EXCLUDEFROMCAPTURE keeps the veil OFF screen captures (Win10 2004+), so the remote
+// session (AnyDesk/RDP) sees the normal desktop while the physical monitors show the veil.
+
+const VEIL_ALPHA: u8 = 230; // "almost fully" — ~90% opaque, the desktop barely shows through
+const TIMER_VEIL_TOPMOST: usize = 1; // periodic re-assert so new topmost windows don't cover it
+
+extern "system" fn veil_monitor_enum(_mon: HMONITOR, _dc: HDC, rc: *mut RECT, lp: LPARAM) -> BOOL {
+    unsafe {
+        (*(lp.0 as *mut Vec<RECT>)).push(*rc);
+        TRUE
+    }
+}
+
+extern "system" fn veil_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+
+                let bg = CreateSolidBrush(rgb(236, 154, 154)); // pastel red
+                FillRect(hdc, &rc, bg);
+                let _ = DeleteObject(bg);
+
+                let font = make_font(((rc.bottom - rc.top) / 12).max(24), 700, false);
+                let old = SelectObject(hdc, font);
+                SetBkMode(hdc, TRANSPARENT);
+                let _ = SetTextColor(hdc, rgb(124, 28, 28)); // deep red, readable on the pastel
+                let mut t = wn("EM CONTROLE REMOTO");
+                DrawTextW(hdc, &mut t, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(hdc, old);
+                let _ = DeleteObject(font);
+
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+unsafe fn show_veil() {
+    hide_veil(); // rebuild from scratch (also handles monitor layout changes)
+    let hinstance: HINSTANCE = GetModuleHandleW(None).map(|h| h.into()).unwrap_or_default();
+    let class = w("EnergyFlagVeil");
+    if !VEIL_CLASS_REGISTERED {
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(veil_wndproc),
+            hInstance: hinstance,
+            lpszClassName: PCWSTR(class.as_ptr()),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        VEIL_CLASS_REGISTERED = true;
+    }
+
+    let mut rects: Vec<RECT> = Vec::new();
+    let _ = EnumDisplayMonitors(None, None, Some(veil_monitor_enum), LPARAM(&mut rects as *mut _ as isize));
+    for rc in rects {
+        let Ok(hwnd) = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            PCWSTR(class.as_ptr()),
+            PCWSTR(w("EnergyFlag Veil").as_ptr()),
+            WS_POPUP,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
+            None,
+            None,
+            hinstance,
+            None,
+        ) else {
+            continue;
+        };
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), VEIL_ALPHA, LWA_ALPHA);
+        // Best-effort: ignored on Windows builds older than 10 2004.
+        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        VEIL_WINDOWS.push(hwnd.0 as isize);
+    }
+}
+
+unsafe fn hide_veil() {
+    for h in VEIL_WINDOWS.drain(..) {
+        let _ = DestroyWindow(HWND(h as *mut c_void));
+    }
+}
+
+// Bring the veil in line with the current state: visible iff Remote Mode AND toggled on.
+unsafe fn sync_veil(hwnd: HWND) {
+    if MODE == Mode::Remote && VEIL_ON {
+        show_veil();
+        let _ = SetTimer(hwnd, TIMER_VEIL_TOPMOST, 3000, None);
+    } else {
+        let _ = KillTimer(hwnd, TIMER_VEIL_TOPMOST);
+        hide_veil();
+    }
 }
 
 // ===================== Auto-update (pull from the public releases repo) =====================
@@ -975,6 +1154,26 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            // Keep the veil above windows that later claim topmost (without stealing focus).
+            WM_TIMER if wparam.0 == TIMER_VEIL_TOPMOST => {
+                for h in VEIL_WINDOWS.iter() {
+                    let _ = SetWindowPos(
+                        HWND(*h as *mut c_void),
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+                LRESULT(0)
+            }
+            // Monitors added/removed/rescaled: rebuild the veil to match the new layout.
+            WM_DISPLAYCHANGE => {
+                sync_veil(hwnd);
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
@@ -993,6 +1192,7 @@ fn main() -> Result<()> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
         MODE = read_mode();
+        VEIL_ON = read_veil();
 
         let app_icon = load_app_icon();
         ABOUT_ICON = app_icon.0 as isize;
