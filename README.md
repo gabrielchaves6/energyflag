@@ -19,7 +19,7 @@ power plan with one of two profiles, chosen from the tray.
 
 - Two modes, chosen from the tray:
 
-  | Setting | **Remote Mode** | **On-Site Mode** |
+  | Setting | **Remote Mode** (RM) | **On-Site Mode** (OS) |
   |---|---|---|
   | Sleep (AC / battery) | Never / Never | 30 min / 20 min |
   | Hibernate (AC / battery) | Never / Never | Never / 180 min |
@@ -35,8 +35,8 @@ power plan with one of two profiles, chosen from the tray.
   front of the machine sees it's being driven remotely. The veil is purely visual — every
   click falls through, it never takes focus, and it's excluded from screen capture, so the
   remote session (AnyDesk/RDP) sees the normal desktop.
-- **Tray-only.** No window, no taskbar entry. The tray shows the EnergyFlag logo; hover it
-  for the active profile, right-click to switch.
+- **Tray-only.** No window, no taskbar entry. The tray icon *is* the indicator: a blue
+  **RM** or **OS** badge tells you which profile is active at a glance.
 - Re-applies the chosen profile at startup, snapping back anything Windows Update or a
   manual Settings tweak changed.
 - Styled **About** window and an in-app **Check for updates** (pulls the latest installer
@@ -74,7 +74,7 @@ Drop a shortcut to `EnergyFlag.exe` in the Startup folder (`Win+R` → `shell:st
 
 ## Usage
 
-Run EnergyFlag. The blue lightning-bolt logo appears in the tray (possibly under the `^`
+Run EnergyFlag. A small blue **RM**/**OS** badge appears in the tray (possibly under the `^`
 overflow). Right-click it:
 
 - **Remote Mode — nunca dorme** / **On-Site Mode — economia** — pick the profile (the

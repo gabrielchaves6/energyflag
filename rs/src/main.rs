@@ -75,7 +75,7 @@ const ONSITE_TIMEOUTS: [(&str, u32); 6] = [
 
 // ---------- Globals (single-threaded; touched only from the message thread) ----------
 static mut MODE: Mode = Mode::Remote;
-static mut TRAY_ICON: isize = 0; // current tray HICON (brand logo, rebuilt on mode change)
+static mut TRAY_ICON: isize = 0; // current tray HICON (RM/OS badge, rebuilt on mode change)
 
 static mut VEIL_ON: bool = false; // persisted toggle: red "EM CONTROLE REMOTO" screen veil
 static mut VEIL_WINDOWS: Vec<isize> = Vec::new(); // one HWND per monitor while the veil is up
@@ -275,15 +275,14 @@ unsafe fn make_text_icon(bg: COLORREF, label: &str) -> HICON {
     hicon
 }
 
-// The tray shows the brand logo (lightning bolt) in both modes — the active mode lives in
-// the tooltip and the menu radio. CopyIcon because refresh_tray destroys the old handle.
-unsafe fn tray_icon() -> HICON {
-    if ABOUT_ICON != 0 {
-        if let Ok(h) = CopyIcon(HICON(ABOUT_ICON as *mut _)) {
-            return h;
-        }
+// The tray badge tells the active mode apart at a glance — RM/OS text, not the brand logo
+// (the logo lives in About, dialogs and the .exe resource).
+unsafe fn mode_icon(mode: Mode) -> HICON {
+    match mode {
+        // Both modes use DeskFlag blue (#2563EB) — only the label differs.
+        Mode::Remote => make_text_icon(rgb(37, 99, 235), "RM"),
+        Mode::OnSite => make_text_icon(rgb(37, 99, 235), "OS"),
     }
-    make_text_icon(rgb(37, 99, 235), "E")
 }
 
 // The brand .ico compiled into the binary, so the lightning-bolt logo shows up on every
@@ -372,7 +371,7 @@ unsafe fn tooltip() -> &'static str {
 }
 
 unsafe fn add_tray(hwnd: HWND) {
-    let icon = tray_icon();
+    let icon = mode_icon(MODE);
     TRAY_ICON = icon.0 as isize;
     let mut nid = tray_base(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
@@ -385,7 +384,7 @@ unsafe fn add_tray(hwnd: HWND) {
 }
 
 unsafe fn refresh_tray(hwnd: HWND) {
-    let icon = tray_icon();
+    let icon = mode_icon(MODE);
     let mut nid = tray_base(hwnd);
     nid.uFlags = NIF_ICON | NIF_TIP;
     nid.hIcon = icon;
