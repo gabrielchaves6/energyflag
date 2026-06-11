@@ -35,6 +35,11 @@ power plan with one of two profiles, chosen from the tray.
   front of the machine sees it's being driven remotely. The veil is purely visual — every
   click falls through, it never takes focus, and it's excluded from screen capture, so the
   remote session (AnyDesk/RDP) sees the normal desktop.
+- **Brilho 0% — via Power Display** (optional, Remote Mode only): asks PowerToys Power
+  Display to set every monitor's brightness to 0% while you drive the machine remotely, and
+  restores it when toggled off, when switching to On-Site Mode, or on exit. EnergyFlag never
+  talks to the monitors itself — it only signals the named events PowerDisplay listens to
+  (see *How it works*).
 - **Tray-only.** No window, no taskbar entry. The tray icon *is* the indicator: a blue
   **RM** or **OS** badge tells you which profile is active at a glance.
 - Re-applies the chosen profile at startup, snapping back anything Windows Update or a
@@ -81,7 +86,28 @@ overflow). Right-click it:
   active one is dotted).
 - **Aviso na tela — EM CONTROLE REMOTO** — toggle the red screen veil (only available in
   Remote Mode; remembered across restarts).
+- **Brilho 0% — via Power Display** — toggle 0% monitor brightness through PowerToys
+  (Remote Mode only; remembered across restarts; requires the one-time PowerToys setup
+  below).
 - **About EnergyFlag** / **Check for updates…** / **Exit**
+
+### One-time PowerToys setup for "Brilho 0%"
+
+The brightness toggle delegates all monitor control to **PowerToys Power Display** (WMI for
+laptop panels, DDC/CI for externals). PowerDisplay applies a saved profile whenever the
+LightSwitch theme events fire, and EnergyFlag signals exactly those events. Setup:
+
+1. In **PowerToys → Power Display**, create two profiles: one with every monitor's
+   brightness at **0%** (e.g. *EnergyFlag Escuro*) and one with your normal brightness
+   (e.g. *EnergyFlag Normal*).
+2. In **PowerToys → Light Switch → Apply monitor settings to**, set the **dark mode
+   profile** to the 0% one and the **light mode profile** to the normal one. The Light
+   Switch *module* can stay disabled (and its schedule **Off**) — PowerDisplay reads the
+   mapping regardless, and keeping it off means nothing else fires those events.
+
+PowerToys must be running for the toggle to have any effect. If you actually use Light
+Switch for automatic theme switching, skip this feature — theme transitions would also
+change your brightness.
 
 ## Build from source
 

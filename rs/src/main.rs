@@ -23,7 +23,7 @@ use windows::Win32::System::Com::Urlmon::URLDownloadToFileW;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
@@ -35,6 +35,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const ID_REMOTE: usize = 1;
 const ID_ONSITE: usize = 2;
 const ID_VEIL: usize = 3;
+const ID_DIM: usize = 4;
 const ID_ABOUT: usize = 12;
 const ID_UPDATE: usize = 13;
 const ID_EXIT: usize = 11;
@@ -80,6 +81,9 @@ static mut TRAY_ICON: isize = 0; // current tray HICON (RM/OS badge, rebuilt on 
 static mut VEIL_ON: bool = false; // persisted toggle: red "EM CONTROLE REMOTO" screen veil
 static mut VEIL_WINDOWS: Vec<isize> = Vec::new(); // one HWND per monitor while the veil is up
 static mut VEIL_CLASS_REGISTERED: bool = false;
+
+static mut DIM_ON: bool = false; // persisted toggle: 0% brightness via PowerToys Power Display
+static mut DIM_ACTIVE: bool = false; // whether we last told Power Display to go dark
 
 static mut ABOUT_HWND: Option<HWND> = None;
 static mut ABOUT_ICON: isize = 0; // brand logo (embedded energyflag.ico, or GDI fallback)
@@ -180,6 +184,14 @@ fn write_veil(on: bool) {
     reg_write("Veil", if on { "1" } else { "0" });
 }
 
+fn read_dim() -> bool {
+    reg_read("Dim").as_deref() == Some("1")
+}
+
+fn write_dim(on: bool) {
+    reg_write("Dim", if on { "1" } else { "0" });
+}
+
 // ---------- Power plan enforcement ----------
 // Run powercfg with the given args, hidden. Returns true on exit code 0.
 fn powercfg(args: &[&str]) -> bool {
@@ -211,6 +223,7 @@ unsafe fn apply_mode(hwnd: HWND, mode: Mode) {
     apply_profile(mode);
     refresh_tray(hwnd);
     sync_veil(hwnd); // the veil only exists in Remote Mode
+    sync_dim(); // ...and so does the 0%-brightness request to Power Display
 }
 
 // ---------- GDI-drawn icons (tray badge "RM"/"OS"; brand fallback "E") ----------
@@ -415,6 +428,10 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         | if VEIL_ON { MF_CHECKED } else { MF_UNCHECKED }
         | if MODE == Mode::Remote { MENU_ITEM_FLAGS(0) } else { MF_GRAYED };
     let _ = AppendMenuW(menu, veil_flags, ID_VEIL, PCWSTR(w("Aviso na tela — EM CONTROLE REMOTO").as_ptr()));
+    let dim_flags = MF_STRING
+        | if DIM_ON { MF_CHECKED } else { MF_UNCHECKED }
+        | if MODE == Mode::Remote { MENU_ITEM_FLAGS(0) } else { MF_GRAYED };
+    let _ = AppendMenuW(menu, dim_flags, ID_DIM, PCWSTR(w("Brilho 0% — via Power Display").as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, PCWSTR(w("About EnergyFlag").as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, PCWSTR(w("Check for updates…").as_ptr()));
@@ -434,6 +451,11 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             write_veil(VEIL_ON);
             sync_veil(hwnd);
         }
+        ID_DIM => {
+            DIM_ON = !DIM_ON;
+            write_dim(DIM_ON);
+            sync_dim();
+        }
         ID_ABOUT => {
             set_active_work();
             show_about();
@@ -443,6 +465,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             check_for_updates(hwnd);
         }
         ID_EXIT => {
+            restore_dim_on_quit();
             remove_tray(hwnd);
             PostQuitMessage(0);
         }
@@ -571,6 +594,54 @@ unsafe fn sync_veil(hwnd: HWND) {
     }
 }
 
+// ===================== 0% brightness via PowerToys Power Display =====================
+// EnergyFlag never touches the monitors itself. PowerToys Power Display owns the hardware
+// (WMI for the internal panel, DDC/CI for externals) and it listens for the LightSwitch
+// theme events, applying the profile mapped in the LightSwitch settings (dark mode profile /
+// light mode profile). LightSwitch itself is disabled, so those events form a free channel:
+// signaling "dark" applies the 0%-brightness profile, "light" restores the normal one.
+// Setup lives in PowerToys: profiles "EnergyFlag Escuro" (0%) and "EnergyFlag Normal" in
+// Power Display, mapped under LightSwitch's "Apply monitor settings to". See the README.
+
+const LS_DARK_EVENT: &str =
+    "Local\\PowerToysLightSwitch-DarkThemeEvent-b3a835c0-eaa2-49b0-b8eb-f793e3df3368";
+const LS_LIGHT_EVENT: &str =
+    "Local\\PowerToysLightSwitch-LightThemeEvent-50077121-2ffc-4841-9c86-ab1bd3f9baca";
+
+// Open-or-create the named auto-reset event and pulse it. PowerDisplay.exe waits on the
+// same name (NativeEventWaiter), so SetEvent wakes its listener exactly once.
+unsafe fn signal_named_event(name: &str) -> bool {
+    let n = w(name);
+    let Ok(h) = CreateEventW(None, FALSE, FALSE, PCWSTR(n.as_ptr())) else {
+        return false;
+    };
+    let ok = SetEvent(h).is_ok();
+    let _ = CloseHandle(h);
+    ok
+}
+
+// Bring brightness in line with the current state: dark iff Remote Mode AND toggled on.
+// Only signals on *transitions*, so EnergyFlag never stomps brightness the user set manually.
+unsafe fn sync_dim() {
+    let want = MODE == Mode::Remote && DIM_ON;
+    if want && !DIM_ACTIVE {
+        if signal_named_event(LS_DARK_EVENT) {
+            DIM_ACTIVE = true;
+        }
+    } else if !want && DIM_ACTIVE {
+        let _ = signal_named_event(LS_LIGHT_EVENT);
+        DIM_ACTIVE = false;
+    }
+}
+
+// Never leave the screens dark behind us (Exit / silent update restart).
+unsafe fn restore_dim_on_quit() {
+    if DIM_ACTIVE {
+        let _ = signal_named_event(LS_LIGHT_EVENT);
+        DIM_ACTIVE = false;
+    }
+}
+
 // ===================== Auto-update (pull from the public releases repo) =====================
 fn ver_tuple(s: &str) -> (u32, u32, u32) {
     let s = s.trim().trim_start_matches('v');
@@ -653,6 +724,7 @@ unsafe fn check_for_updates(hwnd: HWND) {
     let setup_w = w(&setup.to_string_lossy());
     let args_w = w("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
     ShellExecuteW(hwnd, PCWSTR(w("open").as_ptr()), PCWSTR(setup_w.as_ptr()), PCWSTR(args_w.as_ptr()), PCWSTR::null(), SW_SHOWNORMAL);
+    restore_dim_on_quit(); // the relaunched build re-darkens if the toggle is still on
     remove_tray(hwnd);
     PostQuitMessage(0);
 }
@@ -1192,6 +1264,7 @@ fn main() -> Result<()> {
 
         MODE = read_mode();
         VEIL_ON = read_veil();
+        DIM_ON = read_dim();
 
         let app_icon = load_app_icon();
         ABOUT_ICON = app_icon.0 as isize;
